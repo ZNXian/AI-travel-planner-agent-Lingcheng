@@ -59,19 +59,27 @@ def get_llm(temperature: float = 0.7) -> ChatOpenAI:
 
 
 def _extract_json_block(text: str) -> str:
-    """从 LLM 自由文本中抽取最外层的 JSON 对象/数组字符串。"""
+    """从 LLM 自由文本中抽取最外层 JSON 对象或数组字符串。
+
+    优先解析 markdown 代码块；否则从首个 `[` 或 `{` 起用 JSONDecoder.raw_decode
+    截取**恰好一段**合法 JSON（避免旧版贪婪 `\\{[\\s\\S]*\\}` 把 `[{...},{...}]` 截成单对象片段）。
+    """
     if not text:
         return ""
+    stripped = text.strip()
     fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", text)
     if fence:
-        return fence.group(1)
-    obj = re.search(r"\{[\s\S]*\}", text)
-    if obj:
-        return obj.group(0)
-    arr = re.search(r"\[[\s\S]*\]", text)
-    if arr:
-        return arr.group(0)
-    return text.strip()
+        return fence.group(1).strip()
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(stripped):
+        if ch not in "[{":
+            continue
+        try:
+            _, end = dec.raw_decode(stripped, i)
+            return stripped[i:end]
+        except json.JSONDecodeError:
+            continue
+    return stripped
 
 
 def call_llm_json(
@@ -89,9 +97,14 @@ def call_llm_json(
         len(messages) + 1,
     )
     t0 = time.perf_counter()
+    text = ""
     try:
         llm = get_llm(temperature=temperature)
         full_messages: List[BaseMessage] = [SystemMessage(content=system_hint)] + list(messages)
+        _LOG.debug(
+            "llm_invoke_full_messages=%s",
+            full_messages
+        )
         resp = llm.invoke(full_messages)
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
         parsed = json.loads(_extract_json_block(text))
@@ -100,12 +113,27 @@ def call_llm_json(
             (time.perf_counter() - t0) * 1000,
             type(parsed).__name__,
         )
+        _LOG.debug(
+            "llm_invoke_json parsed=%s",
+            parsed
+        )
         return parsed
     except Exception as exc:
         _LOG.info(
             "llm_invoke_json fail elapsed_ms=%.1f err=%s",
             (time.perf_counter() - t0) * 1000,
             type(exc).__name__,
+        )
+        raw = text or ""
+        n = len(raw)
+        head = raw[:200]
+        tail = raw[-20:] if n >= 20 else raw
+        _LOG.debug(
+            "llm_invoke_json raw_preview err=%s raw_chars=%s raw_first200=%r raw_last20=%r",
+            type(exc).__name__,
+            n,
+            head,
+            tail,
         )
         return fallback
 

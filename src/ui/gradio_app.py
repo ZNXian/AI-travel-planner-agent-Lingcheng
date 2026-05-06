@@ -24,6 +24,13 @@ from src.lingcheng_logging import get_logger, setup_lingcheng_logging
 
 _LOG = get_logger("ui.gradio")
 
+# 对话区字体与行高（作用于 Chatbot 容器及 Markdown 正文）
+_UI_CSS = """
+.lingcheng-chatbot { font-size: 1.125rem !important; line-height: 1.65 !important; }
+.lingcheng-chatbot .prose, .lingcheng-chatbot .md { font-size: 1.125rem !important; }
+.lingcheng-chatbot p, .lingcheng-chatbot li { font-size: 1.125rem !important; }
+.lingcheng-input textarea { font-size: 1.0625rem !important; line-height: 1.55 !important; }
+"""
 
 _TITLE = "灵程 Lingcheng · 智能旅行规划助手"
 _SUBTITLE = (
@@ -59,7 +66,6 @@ def _run_turn(
     user_text: str,
     session: Dict[str, Any],
     graph,
-    image: Any = None,
 ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
     """执行一轮对话：把用户输入塞进 state，调用 graph，返回新历史与新会话。"""
     session = _ensure_state(session)
@@ -67,22 +73,14 @@ def _run_turn(
 
     messages = list(agent_state.get("messages") or [])
     text = (user_text or "").strip()
-    if image is not None:
-        if not text:
-            text = "（用户仅上传了图片）"
-        text += (
-            "\n\n（当前未接入视觉模型，无法解析图片内容；"
-            "请尽量用文字描述图片中的关键信息。）"
-        )
     messages.append(HumanMessage(content=text))
     agent_state["messages"] = messages
     agent_state["thinking_steps"] = []
 
     t_turn = time.perf_counter()
     _LOG.info(
-        "conversation_turn start user_chars=%s has_image=%s messages_before=%s",
+        "conversation_turn start user_chars=%s messages_before=%s",
         len(text),
-        image is not None,
         len(messages),
     )
     try:
@@ -128,34 +126,30 @@ def _on_reset():
     initial_history = [{"role": "assistant", "content": _GREETING}]
     initial_state = make_initial_state()
     initial_state["messages"] = [AIMessage(content=_GREETING)]
-    return initial_history, {"agent_state": initial_state}, "", None
+    return initial_history, {"agent_state": initial_state}, ""
 
 
 def build_demo() -> gr.Blocks:
     """构造 Gradio 应用，包含聊天框、发送/重置按钮与会话状态。"""
     compiled_graph = create_agent_graph()
 
-    with gr.Blocks(title=_TITLE) as demo:
+    with gr.Blocks(title=_TITLE, css=_UI_CSS) as demo:
         gr.Markdown(f"# {_TITLE}\n\n{_SUBTITLE}")
 
         chatbot = gr.Chatbot(
             label="灵程",
-            height=520,
+            height=820,
             buttons=["copy"],
             value=[{"role": "assistant", "content": _GREETING}],
+            elem_classes=["lingcheng-chatbot"],
         )
         with gr.Row():
             user_input = gr.Textbox(
                 placeholder="例如：我想 5 月底从上海出发去成都玩 4 天，预算普通，节奏悠闲...",
                 show_label=False,
-                lines=2,
-                scale=6,
-            )
-            optional_image = gr.Image(
-                label="可选图片",
-                type="filepath",
-                height=120,
-                scale=2,
+                lines=3,
+                scale=7,
+                elem_classes=["lingcheng-input"],
             )
             send_btn = gr.Button("发送", variant="primary", scale=1)
             reset_btn = gr.Button("重置", scale=1)
@@ -164,36 +158,35 @@ def build_demo() -> gr.Blocks:
         initial_state["messages"] = [AIMessage(content=_GREETING)]
         session_state = gr.State({"agent_state": initial_state})
 
-        def _submit(user_text: str, session: Dict[str, Any], image: Any):
+        def _submit(user_text: str, session: Dict[str, Any]):
             """Gradio 提交回调：闭包持有 compiled_graph，返回新的 chatbot/session/输入框值。"""
             text_ok = user_text and user_text.strip()
-            if not text_ok and image is None:
+            if not text_ok:
                 history = _agent_state_to_chat_history(
                     (session or {}).get("agent_state") or {}
                 )
-                return history, session or {}, "", None
+                return history, session or {}, ""
             history, new_session = _run_turn(
                 (user_text or "").strip(),
                 session or {},
                 compiled_graph,
-                image=image,
             )
-            return history, new_session, "", None
+            return history, new_session, ""
 
         send_btn.click(
             _submit,
-            inputs=[user_input, session_state, optional_image],
-            outputs=[chatbot, session_state, user_input, optional_image],
+            inputs=[user_input, session_state],
+            outputs=[chatbot, session_state, user_input],
         )
         user_input.submit(
             _submit,
-            inputs=[user_input, session_state, optional_image],
-            outputs=[chatbot, session_state, user_input, optional_image],
+            inputs=[user_input, session_state],
+            outputs=[chatbot, session_state, user_input],
         )
         reset_btn.click(
             _on_reset,
             inputs=[],
-            outputs=[chatbot, session_state, user_input, optional_image],
+            outputs=[chatbot, session_state, user_input],
         )
 
     return demo

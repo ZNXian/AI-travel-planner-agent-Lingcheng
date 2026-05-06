@@ -15,6 +15,10 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from src.agent.llm import call_llm_json, call_llm_text
 from src.agent.state import REQUIRED_PREFERENCE_FIELDS, AgentState, merge_preferences
+from src.lingcheng_logging import get_logger
+
+
+_LOG = get_logger("agent.preference")
 
 
 _EXTRACT_SYSTEM = (
@@ -94,6 +98,218 @@ _COARSE_DATE_PATTERNS = (
     "春节", "元旦", "清明", "五一",
     "端午", "中秋", "国庆", "暑假", "寒假",
 )
+
+_DEST_REJECT_KEYWORDS = (
+    "换一批", "换一个", "重新推荐", "重新推", "再推荐", "再推",
+    "不满意", "不喜欢", "不感兴趣", "都不喜欢", "都不行", "都不要",
+    "换个", "换城市", "再来", "别的城市", "其它城市", "其他城市",
+)
+
+_DEST_REFINE_KEYWORDS = (
+    "北方", "南方", "沿海", "海边", "内陆", "山区", "山里",
+    "雪", "温泉", "沙漠", "草原", "高原", "湖", "河",
+    "古镇", "历史", "文化", "古城", "现代", "国际化",
+    "小众", "冷门", "热门", "网红",
+    "大城市", "县城", "小城",
+    "江南", "西北", "西南", "东北", "华东", "华南", "华中",
+    "面食", "米饭", "辣", "清淡", "海鲜", "烧烤", "面馆", "粤菜", "川菜", "湘菜",
+    "湿热", "干燥", "凉爽", "避暑", "暖和", "温暖", "寒冷", "下雪",
+)
+
+_DEST_REMOVE_KEYWORDS = (
+    "不要", "不需要", "去掉", "去除", "取消", "不再", "别要", "别再",
+    "撤掉", "撤回", "删掉", "删除", "去掉那个", "不想要",
+)
+
+
+def _build_dest_feedback_system(
+    candidate_names: List[str],
+    existing_preferences: List[str],
+) -> str:
+    """构造目的地反馈分类的 system prompt（候选城市与已知偏好内联其中）。"""
+    cand_str = "、".join(candidate_names) if candidate_names else "（无）"
+    prefs_str = (
+        "、".join(f"\"{p}\"" for p in existing_preferences)
+        if existing_preferences
+        else "（无）"
+    )
+    return (
+        f"你是旅行助手。当前用户正在面对你之前推荐的候选目的地：{cand_str}。\n"
+        f"已知用户之前明确表达过的目的地偏好（累积列表）：{prefs_str}。\n"
+        "请判断用户最新一句话对候选的态度，并仅输出严格 JSON：\n"
+        '{"intent":"confirm|switch|refine|reject|other",'
+        '"chosen_city":"","feedback":"",'
+        '"mismatched_cities":[],"removed_preferences":[]}\n'
+        "字段说明：\n"
+        "- intent:\n"
+        "  * confirm = 用户从候选中明确选定一个；\n"
+        "  * switch  = 用户提到候选之外的具体城市名作为目的地；\n"
+        "  * refine  = 用户没点名某个城市，但补充了**与目的地相关**的偏好"
+        "（区域/饮食/气候/景观/城市类型/历史/海边/北方南方/小众/大城市等），暗示当前候选有不合适的；\n"
+        "  * reject  = 用户明确否定（'不满意/换一批/都不喜欢/不感兴趣' 等）但未给具体偏好；\n"
+        "  * other   = 仅补充天数/预算/出发地/出行方式/出发日期等**与目的地无关**的字段；"
+        "或仅仅是想撤回之前的偏好而无新偏好。\n"
+        "- chosen_city: confirm 时填候选中的那个城市名；switch 时填新城市名；其它情况留空字符串。\n"
+        "- feedback: refine/reject 时用一两句中文总结用户对目的地的**新增**偏好"
+        "（如\"想去北方吃面食\"、\"不爱古镇\"），其它情况留空字符串；"
+        "**不要**把已经在已知偏好里的旧条目重复进去。\n"
+        f"- mismatched_cities: 从当前候选 [{cand_str}] 中挑出**明显不符合**用户最新偏好的城市；"
+        "如果整组候选都不符合，把全部候选名都放进去；refine/reject 必须给出非空数组（至少 1 个）；"
+        "confirm/switch/other 一律填空数组。**只能输出当前候选中的城市名，不要编造其它城市**。\n"
+        f"- removed_preferences: 用户当前消息里**明确要求去除/取消/不要**的之前偏好；"
+        f"只能从已知偏好列表 [{prefs_str}] 里挑选**完整字符串项**或其语义子串；"
+        "举例：已知偏好=[\"想去北方吃面食\",\"凉爽避暑\"]，用户说\"不要避暑了\" → "
+        "removed_preferences=[\"凉爽避暑\"]。不删则空数组。\n"
+        "只输出 JSON，不要 markdown 代码围栏，不要前后解释。"
+    )
+
+
+def _heuristic_dest_feedback(
+    text: str,
+    candidate_names: List[str],
+    existing_preferences: List[str],
+) -> Dict[str, Any]:
+    """关键字兜底：识别用户对目的地候选的反馈意图，并尝试推断 removed_preferences。"""
+    removed: List[str] = []
+    if text and any(kw in text for kw in _DEST_REMOVE_KEYWORDS):
+        for pref in existing_preferences:
+            if not pref:
+                continue
+            if pref in text:
+                removed.append(pref)
+                continue
+            for token in re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]+", pref):
+                if len(token) >= 2 and token in text:
+                    removed.append(pref)
+                    break
+        seen: Set[str] = set()
+        removed = [p for p in removed if not (p in seen or seen.add(p))]
+
+    empty: Dict[str, Any] = {
+        "intent": "other",
+        "chosen_city": "",
+        "feedback": "",
+        "mismatched_cities": [],
+        "removed_preferences": removed,
+    }
+    if not text:
+        return empty
+    if any(kw in text for kw in _DEST_REJECT_KEYWORDS):
+        return {
+            "intent": "reject",
+            "chosen_city": "",
+            "feedback": text[:200],
+            "mismatched_cities": list(candidate_names),
+            "removed_preferences": removed,
+        }
+    if removed and not any(kw in text for kw in _DEST_REFINE_KEYWORDS):
+        return empty
+    if any(kw in text for kw in _DEST_REFINE_KEYWORDS):
+        return {
+            "intent": "refine",
+            "chosen_city": "",
+            "feedback": text[:200],
+            "mismatched_cities": list(candidate_names),
+            "removed_preferences": removed,
+        }
+    for name in candidate_names:
+        if name and name in text:
+            return {
+                "intent": "confirm",
+                "chosen_city": name,
+                "feedback": "",
+                "mismatched_cities": [],
+                "removed_preferences": removed,
+            }
+    return empty
+
+
+def _classify_destination_feedback(
+    text: str,
+    candidates: List[Dict[str, Any]],
+    existing_preferences: List[str],
+) -> Dict[str, Any]:
+    """对"用户面对候选目的地"的回复做意图分类：LLM 优先，失败回退启发式。"""
+    candidate_names: List[str] = [
+        (c.get("name") or "").strip()
+        for c in (candidates or [])
+        if isinstance(c, dict) and c.get("name")
+    ]
+    prefs_clean: List[str] = [p for p in (existing_preferences or []) if p]
+    if not text:
+        return {
+            "intent": "other",
+            "chosen_city": "",
+            "feedback": "",
+            "mismatched_cities": [],
+            "removed_preferences": [],
+        }
+
+    llm_result = call_llm_json(
+        messages=[
+            SystemMessage(
+                content=_build_dest_feedback_system(candidate_names, prefs_clean)
+            ),
+            HumanMessage(content=text),
+        ],
+        fallback={},
+    )
+    if (
+        isinstance(llm_result, dict)
+        and llm_result.get("intent")
+        in {"confirm", "switch", "refine", "reject", "other"}
+    ):
+        intent = llm_result["intent"]
+        chosen = (llm_result.get("chosen_city") or "").strip()
+        feedback = (llm_result.get("feedback") or "").strip()
+        raw_mismatched = llm_result.get("mismatched_cities")
+        if isinstance(raw_mismatched, list):
+            cand_set = set(candidate_names)
+            mismatched = [
+                m.strip() for m in raw_mismatched
+                if isinstance(m, str) and m.strip() and m.strip() in cand_set
+            ]
+        else:
+            mismatched = []
+
+        raw_removed = llm_result.get("removed_preferences")
+        removed: List[str] = []
+        if isinstance(raw_removed, list) and prefs_clean:
+            for entry in raw_removed:
+                if not isinstance(entry, str):
+                    continue
+                token = entry.strip()
+                if not token:
+                    continue
+                for pref in prefs_clean:
+                    if token == pref or (len(token) >= 2 and token in pref):
+                        if pref not in removed:
+                            removed.append(pref)
+                        break
+                else:
+                    if token in prefs_clean and token not in removed:
+                        removed.append(token)
+
+        if intent == "confirm" and chosen and chosen not in candidate_names:
+            intent = "switch"
+        if intent == "switch" and not chosen:
+            intent = "other"
+        if intent == "other" and feedback:
+            intent = "refine"
+        if intent in {"refine", "reject"} and not mismatched:
+            mismatched = list(candidate_names)
+        if intent in {"confirm", "switch", "other"}:
+            mismatched = []
+
+        return {
+            "intent": intent,
+            "chosen_city": chosen,
+            "feedback": feedback,
+            "mismatched_cities": mismatched,
+            "removed_preferences": removed,
+        }
+
+    return _heuristic_dest_feedback(text, candidate_names, prefs_clean)
 
 
 def _last_human_text(messages: List[BaseMessage]) -> str:
@@ -202,6 +418,16 @@ def preference_node(state: AgentState) -> Dict[str, Any]:
     preferences: Dict[str, Any] = dict(state.get("preferences") or {})
     thinking_steps: List[str] = list(state.get("thinking_steps") or [])
 
+    existing_candidates: List[Dict[str, Any]] = list(
+        state.get("destination_candidates") or []
+    )
+    rejected_destinations: List[str] = list(state.get("rejected_destinations") or [])
+    destination_preferences: List[str] = [
+        p
+        for p in (state.get("destination_preferences") or [])
+        if isinstance(p, str) and p.strip()
+    ]
+
     user_text = _last_human_text(messages)
     extracted: Dict[str, Any] = {}
 
@@ -217,6 +443,86 @@ def preference_node(state: AgentState) -> Dict[str, Any]:
             extracted = {k: v for k, v in llm_extracted.items() if v not in (None, "")}
         for key, value in _heuristic_extract(user_text).items():
             extracted.setdefault(key, value)
+
+    in_dest_feedback_phase = (
+        bool(existing_candidates) and not state.get("confirmed_destination")
+    )
+    dest_intent = "other"
+    dest_chosen = ""
+    dest_clear_candidates = False
+    dest_mismatched: List[str] = []
+    dest_removed: List[str] = []
+    if in_dest_feedback_phase:
+        feedback_result = _classify_destination_feedback(
+            user_text, existing_candidates, destination_preferences
+        )
+        dest_intent = feedback_result.get("intent", "other")
+        dest_chosen = (feedback_result.get("chosen_city") or "").strip()
+        feedback_text = (feedback_result.get("feedback") or "").strip()
+        dest_mismatched = list(feedback_result.get("mismatched_cities") or [])
+        dest_removed = list(feedback_result.get("removed_preferences") or [])
+        candidate_names = [
+            (c.get("name") or "").strip()
+            for c in existing_candidates
+            if isinstance(c, dict) and c.get("name")
+        ]
+
+        if dest_removed:
+            removed_set = set(dest_removed)
+            destination_preferences = [
+                p for p in destination_preferences if p not in removed_set
+            ]
+            thinking_steps.append(
+                "[偏好收集] 已按用户要求移除偏好："
+                + "、".join(dest_removed)
+                + "；剩余偏好："
+                + ("、".join(destination_preferences) if destination_preferences else "（无）")
+            )
+
+        if dest_intent in ("confirm", "switch") and dest_chosen:
+            extracted["destination"] = dest_chosen
+        elif dest_intent in ("refine", "reject"):
+            extracted.pop("destination", None)
+            dest_clear_candidates = True
+            cities_to_blacklist = dest_mismatched or candidate_names
+            for name in cities_to_blacklist:
+                if name and name not in rejected_destinations:
+                    rejected_destinations.append(name)
+            blacklist_str = (
+                "、".join(cities_to_blacklist) if cities_to_blacklist else "（无）"
+            )
+            if dest_intent == "refine":
+                if feedback_text and feedback_text not in destination_preferences:
+                    destination_preferences.append(feedback_text)
+                thinking_steps.append(
+                    "[偏好收集] 目的地反馈：检测到目的地偏好补充"
+                    + (f"（{feedback_text}）" if feedback_text else "")
+                    + f"，已加入黑名单：{blacklist_str}；"
+                    + "累积偏好："
+                    + ("、".join(destination_preferences) if destination_preferences else "（无）")
+                    + "，将重新推荐。"
+                )
+            else:
+                thinking_steps.append(
+                    "[偏好收集] 目的地反馈：用户表示不满意，已加入黑名单："
+                    + f"{blacklist_str}；保留累积偏好："
+                    + ("、".join(destination_preferences) if destination_preferences else "（无）")
+                    + "，将重新推荐。"
+                )
+        else:
+            thinking_steps.append(
+                f"[偏好收集] 目的地反馈：intent={dest_intent}，未触发重新推荐。"
+            )
+
+        _LOG.info(
+            "pref_dest_feedback intent=%s chosen=%s mismatched=%s removed=%s prefs_after=%s rejected_after=%s",
+            dest_intent,
+            dest_chosen or "-",
+            dest_mismatched,
+            dest_removed,
+            destination_preferences,
+            rejected_destinations,
+        )
 
     changed = merge_preferences(preferences, extracted)
     invalidated = _invalidate_caches(state, changed)
@@ -266,7 +572,7 @@ def preference_node(state: AgentState) -> Dict[str, Any]:
         thinking_steps.append("[偏好收集] 必要偏好已齐全，进入下一步。")
         pending_action = None
 
-    return {
+    result: Dict[str, Any] = {
         "preferences": preferences,
         "thinking_steps": thinking_steps,
         "last_search_cache": invalidated["last_search_cache"],
@@ -276,4 +582,9 @@ def preference_node(state: AgentState) -> Dict[str, Any]:
         "selected_attractions": invalidated["selected_attractions"],
         "pending_action": pending_action,
         "pending_question": pending_question,
+        "rejected_destinations": rejected_destinations,
+        "destination_preferences": destination_preferences,
     }
+    if dest_clear_candidates:
+        result["destination_candidates"] = None
+    return result

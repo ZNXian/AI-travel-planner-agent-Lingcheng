@@ -37,6 +37,9 @@ class AgentState(TypedDict, total=False):
       destination_candidates: destination 节点产出的候选目的地列表。
       attraction_candidates: attraction_sampler 节点展示给用户的候选景点列表。
       selected_attractions: 用户最终选择的景点子集（行程节点核心约束）。
+      rejected_destinations: 用户在多次推荐中明确不满意/排除的城市名（长期黑名单，去重）。
+      destination_preferences: 累积的目的地相关偏好（区域/饮食/气候/类型等）。
+        refine 时追加新条目并去重；reject 不改动；用户显式说"不要/去掉某偏好"时才删除对应项。
     """
 
     messages: Annotated[List[BaseMessage], add_messages]
@@ -50,6 +53,8 @@ class AgentState(TypedDict, total=False):
     destination_candidates: Optional[List[Dict[str, Any]]]
     attraction_candidates: Optional[List[Dict[str, Any]]]
     selected_attractions: Optional[List[Dict[str, Any]]]
+    rejected_destinations: Optional[List[str]]
+    destination_preferences: Optional[List[str]]
 
 
 def make_initial_state() -> AgentState:
@@ -66,6 +71,8 @@ def make_initial_state() -> AgentState:
         destination_candidates=None,
         attraction_candidates=None,
         selected_attractions=None,
+        rejected_destinations=[],
+        destination_preferences=[],
     )
 
 
