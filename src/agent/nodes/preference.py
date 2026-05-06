@@ -22,10 +22,13 @@ _EXTRACT_SYSTEM = (
     "- destination: 目的地城市名（仅城市名，比如 '北京'）\n"
     "- origin: 出发地城市名\n"
     "- days: 旅行天数（整数，如 3）\n"
-    "- budget_level: 预算档次，仅取 '经济'/'普通'/'豪华' 之一\n"
+    "- budget_level: 预算档次，仅取 '经济'/'普通'/'豪华' 之一；"
+    "若用户明确表示'没有具体预算/不限/无所谓/随便/都行/看情况'等，请填 '普通'。\n"
     "- travel_style: 旅行节奏，仅取 '特种兵'/'普通'/'悠闲' 之一\n"
     "- transport_mode: 出行方式，仅取 '高铁'/'飞机' 之一（提到火车/动车也归为高铁，提到航班/机票归为飞机）\n"
-    "- depart_date: 出发日期，YYYY-MM-DD 格式\n"
+    "- depart_date: 出发日期，YYYY-MM-DD 格式（仅当用户给出可解析的具体日期时填写）\n"
+    "- depart_date_text: 大致出行时间（季节/月份/节假日等模糊描述），如 '春天'、'9月'、'国庆假期'、'暑假'。"
+    "若同时给了 depart_date，也尽量补上对应的季节或月份。用户表示'没想好/还没确定/随时'时留空。\n"
     "请仅输出 JSON 对象，键名必须严格使用上述英文。"
 )
 
@@ -63,6 +66,35 @@ _STYLE_KEYWORDS = {
     "慢": "悠闲",
 }
 
+_BUDGET_SKIP_PATTERNS = (
+    "没有具体预算",
+    "没具体预算",
+    "没什么预算",
+    "没预算限制",
+    "不限预算",
+    "预算不限",
+    "无所谓预算",
+    "没想过预算",
+    "预算随意",
+    "预算无所谓",
+    "预算都行",
+    "预算看情况",
+)
+
+_BUDGET_GENERIC_SKIP_PATTERNS = (
+    "随便",
+    "都行",
+    "看情况",
+    "无所谓",
+)
+
+_COARSE_DATE_PATTERNS = (
+    "春天", "夏天", "秋天", "冬天",
+    "春季", "夏季", "秋季", "冬季",
+    "春节", "元旦", "清明", "五一",
+    "端午", "中秋", "国庆", "暑假", "寒假",
+)
+
 
 def _last_human_text(messages: List[BaseMessage]) -> str:
     """取出最近一条 HumanMessage 的文本，没有则返回空串。"""
@@ -85,6 +117,11 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
         if key in text:
             extracted["budget_level"] = value
             break
+    if "budget_level" not in extracted:
+        if any(p in text for p in _BUDGET_SKIP_PATTERNS):
+            extracted["budget_level"] = "普通"
+        elif "预算" in text and any(p in text for p in _BUDGET_GENERIC_SKIP_PATTERNS):
+            extracted["budget_level"] = "普通"
     for key, value in _STYLE_KEYWORDS.items():
         if key in text:
             extracted["travel_style"] = value
@@ -95,6 +132,14 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
             extracted["days"] = int(days_match.group(1))
         except ValueError:
             pass
+    month_match = re.search(r"(1[0-2]|[1-9])\s*月", text)
+    if month_match:
+        extracted["depart_date_text"] = f"{month_match.group(1)}月"
+    if "depart_date_text" not in extracted:
+        for kw in _COARSE_DATE_PATTERNS:
+            if kw in text:
+                extracted["depart_date_text"] = kw
+                break
     return extracted
 
 
@@ -127,7 +172,12 @@ def _invalidate_caches(state: AgentState, changed: Set[str]) -> Dict[str, Any]:
         final_itinerary = None
         attraction_candidates = None
         selected_attractions = None
-    if "transport_mode" in changed or "origin" in changed or "depart_date" in changed:
+    if (
+        "transport_mode" in changed
+        or "origin" in changed
+        or "depart_date" in changed
+        or "depart_date_text" in changed
+    ):
         cache.pop("transport", None)
         final_itinerary = None
     if "budget_level" in changed:
@@ -178,6 +228,20 @@ def preference_node(state: AgentState) -> Dict[str, Any]:
         )
     else:
         thinking_steps.append(f"[偏好收集] 当前已知偏好：{summary_known}")
+
+    if (
+        "budget_level" in changed
+        and preferences.get("budget_level") == "普通"
+        and user_text
+        and (
+            any(p in user_text for p in _BUDGET_SKIP_PATTERNS)
+            or (
+                "预算" in user_text
+                and any(p in user_text for p in _BUDGET_GENERIC_SKIP_PATTERNS)
+            )
+        )
+    ):
+        thinking_steps.append("[偏好收集] 用户未指明预算，按 '普通' 默认处理。")
 
     missing = _missing_required(preferences)
     pending_question: Any = None

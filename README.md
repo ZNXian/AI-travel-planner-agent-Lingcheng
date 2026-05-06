@@ -19,10 +19,12 @@
 ## 功能特性
 
 - **多轮对话偏好收集**：自然友好地追问缺失信息，一次最多 1–2 个问题。
+- **预算可省略**：用户表示「没有具体预算 / 不限 / 无所谓」等时，按 **「普通」** 档次写入偏好，不再卡在这一项。
+- **出行时间可粗可细**：除 `depart_date`（`YYYY-MM-DD`）外，支持 **`depart_date_text`**（如春天、9 月、国庆假期）；未提供出行时间时不追问。
 - **目的地推荐与确认**：根据偏好推荐 1–3 个目的地及理由，等待用户确认。
 - **交通查询**：高铁走 12306 MCP（当前 Mock，含真实接入说明），机票走百炼联网搜索 MCP（当前 Mock）。
-- **酒店与景点推荐**：基于预算等级返回 Mock 数据（覆盖北京/上海/杭州/成都/西安）。
-- **行程生成**：LLM 生成 Markdown 每日行程（上午/下午/晚上 + 餐饮）。
+- **酒店与景点**：酒店可走 FlyAI CLI（配置 `FLYAI_API_KEY` 时）；景点候选由 **`attraction_sampler`** 节点生成（逻辑见下文）。
+- **行程生成**：LLM 生成 Markdown 每日行程（上午/下午/晚上 + 餐饮），并围绕用户已选景点编排。
 - **增量调整**：检测到偏好变化时，只重跑受影响的节点。
 - **思考链路展示**：每条回复带 `<details>` 折叠块，展示 Agent 内部决策步骤。
 
@@ -59,6 +61,34 @@ flowchart TD
 ```
 
 每个非 `response` 节点结束后都会重新进入 `router` 重新评估；`attraction_sampler` 在用户确认目的地之后、交通/酒店/行程之前运行，生成 6–8 个候选景点并等待用户选择 2–3 个（支持「换一批」「换个城市」），选中后再进入 `transport`。
+
+### attraction_sampler：景点生成与 LLM 调用
+
+候选景点在 [`src/agent/nodes/attraction_sampler.py`](src/agent/nodes/attraction_sampler.py) 的 `_generate_candidates` 中产出，分为 **「可选联网检索」** 与 **「必有结构化生成」** 两步，**不是**在同一次 LangChain `invoke` 里开关联网。
+
+1. **可选：百炼联网摘要（原生 OpenAI SDK）**  
+   当同时满足：**已配置 `DASHSCOPE_API_KEY`**，且偏好里存在 **`depart_date` 或 `depart_date_text`（任一非空）** 时，调用 [`src/agent/tools/web_search.py`](src/agent/tools/web_search.py) 的 `web_search`，内部通过 `chat.completions.create(..., extra_body={"enable_search": True})` 拉取联网摘要文本，再拼进下一步的提示词。  
+   若用户**未提供**出行时间（两项皆空），**不调用**联网检索；思考链中会标注为「非联网、仅经典景点」导向。
+
+2. **必有：景点 JSON 列表（LangChain）**  
+   始终调用 [`src/agent/llm.py`](src/agent/llm.py) 的 `call_llm_json`（底层为 **`ChatOpenAI.invoke`**），让模型输出 **严格 JSON 数组**（每条含 `name` / `highlight` / `duration` 等）。本次调用**不带** `enable_search`；若第 1 步有摘要，摘要已作为普通文字写在 `HumanMessage` 里供模型参考。  
+   另会参考 FlyAI POI 或 Mock 景点列表（若有）作为提示中的「本地参考」。
+
+3. **兜底**：若 JSON 解析失败或有效条数不足 6 条，会用代码内嵌的通用 `fallback` 列表补齐（详见源码注释）。
+
+```mermaid
+flowchart TD
+  startNode[生成候选_attraction_sampler]
+  gateNode{有Key且有时间线索}
+  webNode[web_search 百炼enable_search]
+  skipNode[跳过联网无摘要]
+  llmNode[call_llm_json LangChain输出JSON]
+  startNode --> gateNode
+  gateNode -->|是| webNode
+  gateNode -->|否| skipNode
+  webNode --> llmNode
+  skipNode --> llmNode
+```
 
 ---
 
@@ -148,8 +178,8 @@ python run.py
 | 工具 | 当前实现 | 真实接入指引（已在源文件顶部注释） |
 | --- | --- | --- |
 | 12306 高铁查询 | `src/agent/tools/mcp_12306.py` 中的 Mock 车次 | 通过 `subprocess.Popen(["npx", "-y", "12306-mcp"], …)` 启动 MCP server，按 JSON-RPC `initialize → tools/list → tools/call` 三步握手调用 |
-| 百炼联网搜索（机票/通用搜索） | `src/agent/tools/web_search.py` 中的 Mock 航班 | 在百炼控制台启用"联网搜索"工具，使用 `tools=[{"type": "mcp", ...}]` 参数传给 `chat.completions` |
-| 飞猪酒店/景点 | `src/agent/tools/mock_data.py` 静态数据 | 接入 flyai 后替换 `get_hotels` / `get_attractions` 实现 |
+| 百炼联网搜索 | `web_search()`：配置 `DASHSCOPE_API_KEY` 时走 `enable_search`；机票 `search_flights` 仍为 Mock | 景点阶段由 `attraction_sampler` 在满足「Key + 出行时间」时调用；机票真实接入见 `web_search.py` 注释 |
+| 飞猪酒店/景点 | `mock_data.py` 静态数据；酒店/POI 可走 `flyai_api.py`（`FLYAI_API_KEY`） | 详见 `flyai_api.py` 与节点 `lodging` / `itinerary` |
 
 切换到真实实现时，只需替换对应函数体即可，节点层无需改动。
 
