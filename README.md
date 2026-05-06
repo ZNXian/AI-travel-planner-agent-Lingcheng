@@ -1,4 +1,3 @@
-=======
 # Lingcheng 灵程 — 智能旅游规划 Agent
 
 > 多轮对话 · 增量偏好调整 · 思考链路可视化
@@ -44,19 +43,22 @@
 flowchart TD
     Msg([用户消息]) --> Router{router}
     Router -->|缺少必要偏好| Pref[preference 偏好收集]
-    Router -->|偏好齐 / 未确认目的地| Dest[destination 目的地推荐]
-    Router -->|交通方式变化| Trans[transport 交通查询]
-    Router -->|预算变化| Lodg[lodging 酒店推荐]
-    Router -->|全部就绪| Itin[itinerary 行程生成]
-    Pref --> Resp[response 最终回复]
-    Dest --> Resp
-    Trans --> Lodg
-    Lodg --> Itin
-    Itin --> Resp
+    Router -->|未确认目的地| Dest[destination 目的地推荐]
+    Router -->|已确认目的地 / 待选景点| Samp[attraction_sampler 景点候选与选择]
+    Router -->|已选景点 / 缺交通缓存| Trans[transport 交通查询]
+    Router -->|缺酒店缓存| Lodg[lodging 酒店推荐]
+    Router -->|缺行程| Itin[itinerary 行程生成]
+    Router -->|追问或展示候选| Resp[response 最终回复]
+    Pref --> Router
+    Dest --> Router
+    Samp --> Router
+    Trans --> Router
+    Lodg --> Router
+    Itin --> Router
     Resp --> Out([返回给用户])
 ```
 
-每个非 `response` 节点结束后都会重新进入 `router` 重新评估，实现"按需重规划"。
+每个非 `response` 节点结束后都会重新进入 `router` 重新评估；`attraction_sampler` 在用户确认目的地之后、交通/酒店/行程之前运行，生成 6–8 个候选景点并等待用户选择 2–3 个（支持「换一批」「换个城市」），选中后再进入 `transport`。
 
 ---
 
@@ -73,8 +75,8 @@ flowchart TD
 │   │   ├── graph.py          LangGraph 编排
 │   │   ├── state.py          AgentState 定义
 │   │   ├── llm.py            qwen-max 客户端封装
-│   │   ├── nodes/            6 个节点（preference / destination / transport / lodging / itinerary / response）
-│   │   └── tools/            外部工具（mcp_12306 / web_search / mock_data）
+│   │   ├── nodes/            7 个节点（preference / destination / attraction_sampler / transport / lodging / itinerary / response）
+│   │   └── tools/            外部工具（mcp_12306 / web_search / mock_data / flyai_api）
 │   └── ui/
 │       └── gradio_app.py     Gradio 聊天界面
 └── tests/                    （占位）
@@ -164,4 +166,3 @@ python run.py
 ## License
 
 MIT，详见 `LICENSE`。
->>>>>>> Stashed changes
